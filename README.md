@@ -199,5 +199,4 @@ python app.py draw signal.flac recovered.png
 
 或许我们永远收不到回信。
 但至少可以让一张图片，
-
 **以声音的形式，在寂静中再次诞生。**
