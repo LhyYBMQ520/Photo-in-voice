@@ -11,7 +11,7 @@ from mutagen.flac import FLAC
 F_MIN = 500                         # 音频频率最小值（对应图像黑色）
 F_MAX = 3000                        # 音频频率最大值（对应图像白色）
 SAMPLE_RATE = 44100                 # 音频采样率
-SAMPLES_PER_PIXEL = 128             # 每个像素点对应的音频采样点数（决定音频时长和分辨率）
+SAMPLES_PER_PIXEL = 48             # 每个像素点对应的音频采样点数（决定音频时长和分辨率）
 
 # ====== 解码与显示参数配置 ======
 SCREEN_W = 1280                     # 显示窗口宽度（像素）

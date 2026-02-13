@@ -144,7 +144,7 @@ python app.py draw signal.flac recovered.png
 | F_MIN             | 500   | 音频频率最小值（对应图像黑色） |
 | F_MAX             | 3000  | 音频频率最大值（对应图像白色） |
 | SAMPLE_RATE       | 44100 | 音频采样率 |
-| SAMPLES_PER_PIXEL | 128   | 每个像素点对应的音频采样点数（越大音频越长，频率检测越稳定） |
+| SAMPLES_PER_PIXEL | 48   | 每个像素点对应的音频采样点数（越大音频越长，频率检测越稳定） |
 | SCREEN_W          | 1280  | 解码显示窗口宽度（像素） |
 | SCREEN_H          | 720   | 解码显示窗口高度（像素） |
 | N_FFT             | 512   | FFT变换点数（影响频率解析精度） |
@@ -171,7 +171,7 @@ python app.py draw signal.flac recovered.png
   "height": 1080,
   "F_MIN": 500,
   "F_MAX": 3000,
-  "SAMPLES_PER_PIXEL": 128,
+  "SAMPLES_PER_PIXEL": 48,
   "SAMPLE_RATE": 44100,
   "N_FFT": 512
 }
