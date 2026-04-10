@@ -6,6 +6,7 @@ import json
 import os
 import warnings
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
 import soundfile as sf
 from mutagen.flac import FLAC
 
@@ -22,6 +23,11 @@ N_FFT = 512                         # 快速傅里叶变换的点数（影响频
 VOLUME_PERCENT = 5                  # 播放音频时的音量（百分比，避免音量过大）
 ENCODE_COLUMN_BLOCK = 8             # 编码时每个任务处理的列数（越小越省内存，推荐值为CPU核心数（并非线程数）的1/2）
 DECODE_PIXEL_BLOCK = 8192           # 解码时每批处理的像素数（越小越省内存）
+ALLOW_LARGE_IMAGES = True           # 允许处理超大分辨率图像
+ENCODE_PARALLEL_MODE = "auto"      # 编码并行模式：auto/thread（用线程池并行）/process（用多进程池并行）
+DECODE_PARALLEL_MODE = "auto"      # 解码并行模式：auto/thread（用线程池并行）/process（用多进程池并行）
+MAX_ENCODE_TASK_BYTES = 32 * 1024 * 1024  # 单个编码任务目标字节上限（用于自适应分块）
+MAX_DECODE_TASK_BYTES = 32 * 1024 * 1024  # 单个解码任务目标字节上限（用于自动选择并行后端）
 # =====================
 
 
@@ -30,6 +36,81 @@ def _resolve_workers(workers):
     if workers is None:
         return cpu_total
     return max(1, min(int(workers), cpu_total))
+
+
+def _configure_large_image_support():
+    if ALLOW_LARGE_IMAGES:
+        # 压测场景使用可信本地图片时，关闭Pillow像素炸弹保护
+        Image.MAX_IMAGE_PIXELS = None
+        warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
+
+
+def _iter_parallel_results(func, tasks, workers, backend):
+    if workers <= 1:
+        for task in tasks:
+            yield func(task)
+        return
+
+    if backend == "thread":
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for result in executor.map(func, tasks):
+                yield result
+        return
+
+    if backend == "process":
+        with mp.Pool(processes=workers, maxtasksperchild=64) as pool:
+            for result in pool.imap(func, tasks, chunksize=1):
+                yield result
+        return
+
+    raise ValueError(f"未知并行模式: {backend}")
+
+
+def _resolve_encode_backend(workers, bytes_per_column):
+    if workers <= 1:
+        return "sync"
+
+    mode = ENCODE_PARALLEL_MODE.lower()
+    if mode not in {"auto", "thread", "process"}:
+        mode = "auto"
+
+    if mode == "thread":
+        return "thread"
+    if mode == "process":
+        return "process"
+
+    # Windows下大数组跨进程回传易触发1450资源不足，auto默认改用线程并行
+    if os.name == "nt":
+        return "thread"
+
+    # 单列已接近传输上限时，避免使用进程池回传大数组
+    if bytes_per_column >= MAX_ENCODE_TASK_BYTES:
+        return "thread"
+
+    return "process"
+
+
+def _resolve_decode_backend(workers, block_bytes):
+    if workers <= 1:
+        return "sync"
+
+    mode = DECODE_PARALLEL_MODE.lower()
+    if mode not in {"auto", "thread", "process"}:
+        mode = "auto"
+
+    if mode == "thread":
+        return "thread"
+    if mode == "process":
+        return "process"
+
+    # Windows下解码多进程同样存在较高进程通信成本，auto优先线程并行
+    if os.name == "nt":
+        return "thread"
+
+    if block_bytes >= MAX_DECODE_TASK_BYTES:
+        return "thread"
+
+    return "process"
 
 
 def _import_pygame():
@@ -52,8 +133,10 @@ def _encode_chunk(args):
         return np.empty(0, dtype=np.float32)
 
     t_base = np.arange(samples_per_pixel, dtype=np.float32) / sample_rate
-    freqs = f_min + chunk.reshape(-1) * (f_max - f_min)
-    waves = np.sin(2 * np.pi * freqs[:, None] * t_base[None, :])
+    pixels = chunk.reshape(-1).astype(np.float32) / np.float32(255.0)
+    freqs = np.float32(f_min) + pixels * np.float32(f_max - f_min)
+    phase = np.float32(2.0 * np.pi) * freqs[:, None] * t_base[None, :]
+    waves = np.sin(phase).astype(np.float32, copy=False)
     return waves.reshape(-1).astype(np.float32)
 
 
@@ -115,38 +198,48 @@ def image_to_audio(image_path, output_flac, workers=None):
 
     print(f"🖼️ 加载图像: {image_path}")
     total_start = time.perf_counter()
+    _configure_large_image_support()
 
     # 打开图像并转换为灰度模式（L模式：0=黑，255=白）
     prep_start = time.perf_counter()
     img = Image.open(image_path).convert('L')
     width, height = img.size         # 获取图像的宽和高
     # 将像素值转换为0-1之间的浮点数
-    pixels = np.asarray(img, dtype=np.float32) / 255.0
-    data = pixels.T
+    pixels_u8 = np.asarray(img, dtype=np.uint8)
+    data_u8 = pixels_u8.T
     workers = _resolve_workers(workers)
     total_samples = width * height * SAMPLES_PER_PIXEL
-    column_block = max(1, min(ENCODE_COLUMN_BLOCK, width))
+    bytes_per_column = height * SAMPLES_PER_PIXEL * np.dtype(np.float32).itemsize
+    max_cols_by_bytes = max(1, MAX_ENCODE_TASK_BYTES // max(1, bytes_per_column))
+    column_block = max(1, min(ENCODE_COLUMN_BLOCK, max_cols_by_bytes, width))
+    encode_backend = _resolve_encode_backend(workers, bytes_per_column)
     prep_time = time.perf_counter() - prep_start
 
     def _encode_tasks():
-        for start_col in range(0, data.shape[0], column_block):
-            chunk = data[start_col:start_col + column_block]
+        for start_col in range(0, data_u8.shape[0], column_block):
+            chunk = data_u8[start_col:start_col + column_block]
             yield (chunk, F_MIN, F_MAX, SAMPLES_PER_PIXEL, SAMPLE_RATE)
 
     # 分块写入FLAC，避免完整音频常驻内存
     encode_start = time.perf_counter()
-    with sf.SoundFile(output_flac, mode="w", samplerate=SAMPLE_RATE, channels=1, format="FLAC") as out_file:
-        if workers > 1:
-            with mp.Pool(processes=workers) as pool:
-                for audio_part in pool.imap(_encode_chunk, _encode_tasks(), chunksize=1):
-                    out_file.write(np.clip(audio_part, -1.0, 1.0))
-        else:
-            for task in _encode_tasks():
-                audio_part = _encode_chunk(task)
+    try:
+        with sf.SoundFile(output_flac, mode="w", samplerate=SAMPLE_RATE, channels=1, format="FLAC") as out_file:
+            for audio_part in _iter_parallel_results(_encode_chunk, _encode_tasks(), workers, encode_backend):
                 out_file.write(np.clip(audio_part, -1.0, 1.0))
+    except (OSError, ValueError) as err:
+        if encode_backend == "process":
+            print(f"⚠️ 进程并行回传失败，自动降级为线程并行重试: {err}")
+            with sf.SoundFile(output_flac, mode="w", samplerate=SAMPLE_RATE, channels=1, format="FLAC") as out_file:
+                for audio_part in _iter_parallel_results(_encode_chunk, _encode_tasks(), workers, "thread"):
+                    out_file.write(np.clip(audio_part, -1.0, 1.0))
+            encode_backend = "thread"
+        else:
+            raise
     encode_time = time.perf_counter() - encode_start
 
     print(f"⚙️ 编码并行进程数: {workers}")
+    print(f"⚙️ 编码并行模式: {encode_backend}")
+    print(f"⚙️ 编码列分块大小: {column_block}")
 
     # 构建元数据字典：保存解码所需的关键参数
     metadata = {
@@ -241,6 +334,8 @@ def decode_play_draw(input_flac, output_image_path, workers=None):
     image_surface = pg.Surface((width, height))
     img_uint8 = np.zeros((height, width), dtype=np.uint8)
     pixel_block = max(1, min(DECODE_PIXEL_BLOCK, num_pixels))
+    decode_block_bytes = pixel_block * SAMPLES_PER_PIXEL * np.dtype(np.float32).itemsize
+    decode_backend = _resolve_decode_backend(workers, decode_block_bytes)
     io_time = 0.0
     fft_time = 0.0
     draw_time = 0.0
@@ -253,8 +348,51 @@ def decode_play_draw(input_flac, output_image_path, workers=None):
 
         processed_pixels = 0
 
-        if workers > 1:
-            with mp.Pool(processes=workers) as pool:
+        if workers > 1 and decode_backend == "process":
+            try:
+                with mp.Pool(processes=workers, maxtasksperchild=64) as pool:
+                    while processed_pixels < num_pixels:
+                        current_pixels = min(pixel_block, num_pixels - processed_pixels)
+                        block_frames = current_pixels * SAMPLES_PER_PIXEL
+
+                        io_start = time.perf_counter()
+                        audio_block = audio_file.read(block_frames, dtype="float32", always_2d=True)
+                        io_time += time.perf_counter() - io_start
+                        if audio_block.shape[0] < block_frames:
+                            print("⚠️ 音频过短，无法完整解码")
+                            return
+
+                        mono = audio_block[:, 0]
+                        frames = mono.reshape(current_pixels, SAMPLES_PER_PIXEL)
+
+                        frame_chunks = [
+                            chunk for chunk in np.array_split(frames, workers, axis=0)
+                            if chunk.size > 0
+                        ]
+                        task_args = [
+                            (chunk, N_FFT, f_min_idx, f_max_idx, freqs, F_MIN, F_MAX)
+                            for chunk in frame_chunks
+                        ]
+
+                        fft_start = time.perf_counter()
+                        gray_chunks = pool.map(_decode_chunk, task_args)
+                        gray_block = np.concatenate(gray_chunks)
+                        fft_time += time.perf_counter() - fft_start
+
+                        draw_start = time.perf_counter()
+                        _draw_gray_block(
+                            pg, screen, image_surface, img_uint8, gray_block,
+                            processed_pixels, height
+                        )
+                        draw_time += time.perf_counter() - draw_start
+                        processed_pixels += current_pixels
+            except (OSError, ValueError) as err:
+                print(f"⚠️ 解码进程并行失败，自动降级为线程并行重试: {err}")
+                audio_file.seek(processed_pixels * SAMPLES_PER_PIXEL)
+                decode_backend = "thread"
+
+        if workers > 1 and decode_backend == "thread":
+            with ThreadPoolExecutor(max_workers=workers) as executor:
                 while processed_pixels < num_pixels:
                     current_pixels = min(pixel_block, num_pixels - processed_pixels)
                     block_frames = current_pixels * SAMPLES_PER_PIXEL
@@ -279,7 +417,7 @@ def decode_play_draw(input_flac, output_image_path, workers=None):
                     ]
 
                     fft_start = time.perf_counter()
-                    gray_chunks = pool.map(_decode_chunk, task_args)
+                    gray_chunks = list(executor.map(_decode_chunk, task_args))
                     gray_block = np.concatenate(gray_chunks)
                     fft_time += time.perf_counter() - fft_start
 
@@ -290,7 +428,9 @@ def decode_play_draw(input_flac, output_image_path, workers=None):
                     )
                     draw_time += time.perf_counter() - draw_start
                     processed_pixels += current_pixels
-        else:
+
+        if workers <= 1 or decode_backend == "sync":
+            decode_backend = "sync"
             while processed_pixels < num_pixels:
                 current_pixels = min(pixel_block, num_pixels - processed_pixels)
                 block_frames = current_pixels * SAMPLES_PER_PIXEL
@@ -327,6 +467,7 @@ def decode_play_draw(input_flac, output_image_path, workers=None):
     save_time = time.perf_counter() - save_start
 
     print(f"✅ 解码完成并保存: {output_image_path}")
+    print(f"⚙️ 解码并行模式: {decode_backend}")
     print("⏱️ 解码计时:")
     print(f"   元数据读取: {metadata_time:.3f} 秒")
     print(f"   音频分块读取: {io_time:.3f} 秒")
